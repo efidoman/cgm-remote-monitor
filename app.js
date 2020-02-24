@@ -7,6 +7,7 @@ const bodyParser = require('body-parser');
 
 const path = require('path');
 const fs = require('fs');
+const ejs = require('ejs');
 
 function create (env, ctx) {
   var app = express();
@@ -18,12 +19,12 @@ function create (env, ctx) {
   if (!insecureUseHttp) {
     console.info('Redirecting http traffic to https because INSECURE_USE_HTTP=', insecureUseHttp);
     app.use((req, res, next) => {
-      if (req.header('x-forwarded-proto') == 'https' || req.secure) {
+      if (req.header('x-forwarded-proto') === 'https' || req.secure) {
         next();
       } else {
         res.redirect(307, `https://${req.header('host')}${req.url}`);
       }
-    })
+    });
     if (secureHstsHeader) { // Add HSTS (HTTP Strict Transport Security) header
       console.info('Enabled SECURE_HSTS_HEADER (HTTP Strict Transport Security)');
       const helmet = require('helmet');
@@ -61,7 +62,7 @@ function create (env, ctx) {
         }));
         app.use(helmet.referrerPolicy({ policy: 'no-referrer' }));
         app.use(helmet.featurePolicy({ features: { payment: ["'none'"], } }));
-        app.use(bodyParser.json({ type: ['json', 'application/csp-report'] }))
+        app.use(bodyParser.json({ type: ['json', 'application/csp-report'] }));
         app.post('/report-violation', (req, res) => {
           if (req.body) {
             console.log('CSP Violation: ', req.body)
@@ -84,9 +85,22 @@ function create (env, ctx) {
 
   let cacheBuster = 'developmentMode';
   if (process.env.NODE_ENV !== 'development') {
-    cacheBuster = fs.readFileSync(process.cwd() + '/tmp/cacheBusterToken').toString().trim();
+    if (fs.existsSync(process.cwd() + '/tmp/cacheBusterToken')) {
+      cacheBuster = fs.readFileSync(process.cwd() + '/tmp/cacheBusterToken').toString().trim();
+    } else {
+      cacheBuster = fs.readFileSync(__dirname + '/tmp/cacheBusterToken').toString().trim();
+    }
   }
   app.locals.cachebuster = cacheBuster;
+
+  app.get("/sw.js", (req, res) => {
+    res.setHeader('Content-Type', 'application/javascript');
+    res.send(ejs.render(fs.readFileSync(
+      require.resolve(`${__dirname}/views/service-worker.js`),
+      { encoding: 'utf-8' }),
+      { locals: app.locals}
+     ));
+  });
 
   if (ctx.bootErrors && ctx.bootErrors.length > 0) {
     app.get('*', require('./lib/server/booterror')(ctx));
@@ -113,8 +127,11 @@ function create (env, ctx) {
   ///////////////////////////////////////////////////
   // api and json object variables
   ///////////////////////////////////////////////////
+  const apiRoot = require('./lib/api/root')(env, ctx);
   var api = require('./lib/api/')(env, ctx);
+  var api3 = require('./lib/api3/')(env, ctx);
   var ddata = require('./lib/data/endpoints')(env, ctx);
+  var notificationsV2 = require('./lib/api/notifications-v2')(app, ctx);
 
   app.use(compression({
     filter: function shouldCompress (req, res) {
@@ -124,49 +141,77 @@ function create (env, ctx) {
     }
   }));
 
+  var appPages = {
+    "/": {
+      file: "index.html"
+      , type: "index"
+    }
+    , "/admin": {
+      file: "adminindex.html"
+      , title: 'Admin Tools'
+      , type: 'admin'
+    }
+    , "/food": {
+      file: "foodindex.html"
+      , title: 'Food Editor'
+      , type: 'food'
+    }
+    , "/profile": {
+      file: "profileindex.html"
+      , title: 'Profile Editor'
+      , type: 'profile'
+    }
+    , "/report": {
+      file: "reportindex.html"
+      , title: 'Nightscout reporting'
+      , type: 'report'
+    }
+    , "/translations": {
+      file: "translationsindex.html"
+      , title: 'Nightscout translations'
+      , type: 'translations'
+    }
+    , "/split": {
+      file: "frame.html"
+      , title: '8-user view'
+      , type: 'index'
+    }
+  };
+
+  Object.keys(appPages).forEach(function(page) {
+    app.get(page, (req, res) => {
+      res.render(appPages[page].file, {
+        locals: app.locals,
+        title: appPages[page].title ? appPages[page].title : '',
+        type: appPages[page].type ? appPages[page].type : '',
+        settings: env.settings
+      });
+    });
+  });
+
   const clockviews = require('./lib/server/clocks.js')(env, ctx);
   clockviews.setLocals(app.locals);
 
   app.use("/clock", clockviews);
 
-  app.get("/", (req, res) => {
-    res.render("index.html", {
-      locals: app.locals
-    });
-  });
-
-  var appPages = {
-    "/clock-color.html": "clock-color.html"
-    , "/admin": "adminindex.html"
-    , "/profile": "profileindex.html"
-    , "/food": "foodindex.html"
-    , "/bgclock.html": "bgclock.html"
-    , "/report": "reportindex.html"
-    , "/translations": "translationsindex.html"
-    , "/clock.html": "clock.html"
-  };
-
-  Object.keys(appPages).forEach(function(page) {
-    app.get(page, (req, res) => {
-      res.render(appPages[page], {
-        locals: app.locals
-      });
-    });
-  });
-
-  app.get("/appcache/*", (req, res) => {
-    res.render("nightscout.appcache", {
-      locals: app.locals
-    });
-  });
+  app.use('/api', bodyParser({
+    limit: 1048576 * 50
+  }), apiRoot);
 
   app.use('/api/v1', bodyParser({
+    limit: 1048576 * 50
+  }), api);
+
+  app.use('/api/v2', bodyParser({
     limit: 1048576 * 50
   }), api);
 
   app.use('/api/v2/properties', ctx.properties);
   app.use('/api/v2/authorization', ctx.authorization.endpoints);
   app.use('/api/v2/ddata', ddata);
+  app.use('/api/v2/notifications', notificationsV2);
+
+  app.use('/api/v3', api3);
 
   // pebble data
   app.get('/pebble', ctx.pebble);
@@ -220,7 +265,7 @@ function create (env, ctx) {
 
   app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
-  app.use('/swagger-ui-dist', (req, res, next) => {
+  app.use('/swagger-ui-dist', (req, res) => {
     res.redirect(307, '/api-docs');
   });
 
@@ -229,10 +274,13 @@ function create (env, ctx) {
 
   app.locals.bundle = '/bundle';
 
+  app.locals.mode = 'production';
+
   if (process.env.NODE_ENV === 'development') {
 
     console.log('Development mode');
 
+    app.locals.mode = 'development';
     app.locals.bundle = '/devbundle';
 
     const webpack = require('webpack');
@@ -254,9 +302,16 @@ function create (env, ctx) {
   }
 
   // Production bundling
-  var tmpFiles = express.static('tmp', {
-    maxAge: maxAge
-  });
+  var tmpFiles;
+  if (fs.existsSync(process.cwd() + '/tmp/cacheBusterToken')) {
+    tmpFiles = express.static('tmp', {
+      maxAge: maxAge
+    });
+  } else {
+    tmpFiles = express.static(__dirname + '/tmp', {
+      maxAge: maxAge
+    });
+  }
 
   // serve the static content
   app.use('/bundle', tmpFiles);
